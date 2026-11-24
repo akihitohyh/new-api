@@ -7,16 +7,21 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/plugins"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/request_plugin_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -191,6 +196,9 @@ func TestClaudeCountTokensRelay(t *testing.T) {
 	require.NoError(t, i18n.Init())
 	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Log{}))
 	cacheEnabled, autoDisable, logConsume := common.MemoryCacheEnabled, common.AutomaticDisableChannelEnabled, common.LogConsumeEnabled
+	oldRetries := common.RetryTimes
+	common.RetryTimes = 3
+	t.Cleanup(func() { common.RetryTimes = oldRetries })
 	disableCodes := operation_setting.AutomaticDisableStatusCodeRanges
 	global := model_setting.GetGlobalSettings()
 	globalPassThrough := global.PassThroughRequestEnabled
@@ -212,7 +220,8 @@ func TestClaudeCountTokensRelay(t *testing.T) {
 		header http.Header
 		body   string
 	}
-	calls := make(chan observed, 2)
+	var mu sync.Mutex
+	var calls []observed
 	wrong := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("count_tokens reached OpenAI: %s", r.URL)
 		w.WriteHeader(http.StatusTeapot)
@@ -224,24 +233,32 @@ func TestClaudeCountTokensRelay(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		calls <- observed{r.URL.RequestURI(), r.Header.Clone(), string(data)}
+		mu.Lock()
+		calls = append(calls, observed{r.URL.RequestURI(), r.Header.Clone(), string(data)})
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Header.Get("X-Fixture-Status") {
 		case "429":
 			w.Header().Set("Retry-After", "4")
 			w.WriteHeader(429)
 			_, _ = io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"},"request_id":"req1"}`)
+		case "502":
+			w.Header().Set("request-id", "req-proxy")
+			w.WriteHeader(502)
+			_, _ = io.WriteString(w, strings.Repeat("x", 65537))
 		case "500":
+			w.Header().Set("request-id", "req-server")
 			w.WriteHeader(500)
-			_, _ = io.WriteString(w, `{"type":"error","error":{"type":"api_error","message":"try later"}}`)
+			_, _ = io.WriteString(w, `{"type":"error","error":{"type":"api_error","message":"try later native-key at 10.2.3.4","debug":"native-key"},"config":"private"}`)
 		default:
+			w.Header().Set("request-id", "req-ok")
 			_, _ = io.WriteString(w, success)
 		}
 	}))
 	defer upstream.Close()
 	native := model.Channel{
 		Type: constant.ChannelTypeAnthropic, Name: "native", Key: "native-key", BaseURL: &upstream.URL,
-		Group: "default", Models: "alias", Status: common.ChannelStatusEnabled, AutoBan: common.GetPointer(1),
+		Group: "default", Models: "alias,claude-opus-4-8-high", Status: common.ChannelStatusEnabled, AutoBan: common.GetPointer(1),
 		ModelMapping:   common.GetPointer(`{"alias":"native-model"}`),
 		HeaderOverride: common.GetPointer(`{"x-check":"override","x-fixture-status":"{client_header:x-fixture-status}"}`),
 		ParamOverride:  common.GetPointer(`{"system":"count system"}`),
@@ -255,6 +272,7 @@ func TestClaudeCountTokensRelay(t *testing.T) {
 		require.NoError(t, ch.AddAbilities(nil))
 	}
 	engine := gin.New()
+	engine.Use(func(c *gin.Context) { c.Set(common.RequestIdKey, "req-gateway"); c.Next() })
 	SetRelayRouter(engine)
 	for _, tc := range []struct {
 		name                    string
@@ -263,8 +281,9 @@ func TestClaudeCountTokensRelay(t *testing.T) {
 		channelPass, globalPass bool
 	}{
 		{"mapped request", 200, success, false, false},
+		{"normalized model", 200, success, false, false},
 		{"rate limited", 429, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"},"request_id":"req1"}`, false, false},
-		{"server error", 500, `{"type":"error","error":{"type":"api_error","message":"try later"}}`, false, false},
+		{"server error", 500, `{"type":"error","error":{"type":"api_error","message":"try later *** at ***.***.***.***"},"request_id":"req-server"}`, false, false},
 		{"channel passthrough", 200, success, true, false},
 		{"global passthrough", 200, success, false, true},
 		{"only OpenAI serves model", 404, "", false, false},
@@ -276,6 +295,9 @@ func TestClaudeCountTokensRelay(t *testing.T) {
 			if tc.status == 404 {
 				payload = strings.Replace(payload, "alias", "other-only", 1)
 			}
+			if tc.name == "normalized model" {
+				payload = strings.Replace(payload, "alias", "claude-opus-4-8-high", 1)
+			}
 			req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens?beta=true", strings.NewReader(payload))
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("x-api-key", token.Key)
@@ -285,6 +307,9 @@ func TestClaudeCountTokensRelay(t *testing.T) {
 			req.Header.Set("x-fixture-status", fmt.Sprint(tc.status))
 			w := httptest.NewRecorder()
 			engine.ServeHTTP(w, req)
+			mu.Lock()
+			defer mu.Unlock()
+			defer func() { calls = nil }()
 			require.Equal(t, tc.status, w.Code, w.Body.String())
 			if tc.status == 404 {
 				assert.Empty(t, calls)
@@ -298,7 +323,7 @@ func TestClaudeCountTokensRelay(t *testing.T) {
 				return
 			}
 			require.Len(t, calls, 1)
-			call := <-calls
+			call := calls[0]
 			assert.Equal(t, "/v1/messages/count_tokens?beta=true", call.path)
 			assert.Equal(t, "native-key", call.header.Get("x-api-key"))
 			assert.Equal(t, "fixture-version", call.header.Get("anthropic-version"))
@@ -307,15 +332,120 @@ func TestClaudeCountTokensRelay(t *testing.T) {
 			if tc.channelPass || tc.globalPass {
 				assert.Equal(t, requestBody, call.body)
 			} else {
-				assert.JSONEq(t, `{"model":"native-model","messages":[{"role":"user","content":"hello"}],"future_field":{"n":9007199254740993},"system":"count system"}`, call.body)
+				expectedBody := `{"model":"native-model","messages":[{"role":"user","content":"hello"}],"future_field":{"n":9007199254740993},"system":"count system"}`
+				if tc.name == "normalized model" {
+					expectedBody = strings.Replace(expectedBody, "native-model", "claude-opus-4-8", 1)
+				}
+				assert.JSONEq(t, expectedBody, call.body)
 				assert.Contains(t, call.body, "9007199254740993")
 			}
-			assert.Equal(t, tc.response, w.Body.String())
+			if tc.status == 200 {
+				assert.Equal(t, tc.response, w.Body.String())
+				assert.Equal(t, "req-ok", w.Header().Get("request-id"))
+			} else {
+				assert.JSONEq(t, tc.response, w.Body.String())
+			}
+			if tc.status == 500 {
+				assert.Equal(t, "req-server", w.Header().Get("request-id"))
+				assert.NotContains(t, w.Body.String(), "native-key")
+				assert.NotContains(t, w.Body.String(), "10.2.3.4")
+			}
 			if tc.status == 429 {
 				assert.Equal(t, "4", w.Header().Get("Retry-After"))
 			}
 		})
 	}
+	post := func(path, body, key string, headers map[string]string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set("x-api-key", key)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-fixture-status", "200")
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		return w
+	}
+	takeCalls := func() []observed { mu.Lock(); defer mu.Unlock(); got := calls; calls = nil; return got }
+	t.Run("equivalent route", func(t *testing.T) {
+		for _, path := range []string{"/v1/messages/%63ount_tokens", "http://gateway.test/v1/messages/count_tokens?beta=true"} {
+			w := post(path, requestBody, token.Key, nil)
+			require.Equal(t, 200, w.Code, w.Body.String())
+			got := takeCalls()
+			require.Len(t, got, 1)
+			assert.Equal(t, constant.ClaudeCountTokensPath, strings.SplitN(got[0].path, "?", 2)[0])
+		}
+	})
+	t.Run("oversized error is localized", func(t *testing.T) {
+		for lang, want := range map[string]string{"en": "Upstream token counting request failed", "zh-CN": "上游令牌计数请求失败", "zh-TW": "上游權杖計數請求失敗"} {
+			w := post(constant.ClaudeCountTokensPath, requestBody, token.Key, map[string]string{"Accept-Language": lang, "x-fixture-status": "502"})
+			require.Equal(t, 502, w.Code)
+			assert.Contains(t, w.Body.String(), want)
+			assert.Less(t, w.Body.Len(), 512)
+			assert.Equal(t, "req-proxy", w.Header().Get("request-id"))
+			assert.Len(t, takeCalls(), 1)
+		}
+	})
+	t.Run("pinned channels", func(t *testing.T) {
+		wrongPin := fmt.Sprintf("%s-%d", token.Key, other.Id)
+		w := post(constant.ClaudeCountTokensPath, requestBody, wrongPin, nil)
+		require.Equal(t, 403, w.Code)
+		require.NoError(t, model.DB.Model(&user).Update("role", common.RoleAdminUser).Error)
+		t.Cleanup(func() { require.NoError(t, model.DB.Model(&user).Update("role", common.RoleCommonUser).Error) })
+		w = post(constant.ClaudeCountTokensPath, requestBody, wrongPin, nil)
+		require.Equal(t, 404, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), "not_found_error")
+		assert.Equal(t, "req-gateway", w.Header().Get("request-id"))
+		assert.Contains(t, w.Body.String(), `"request_id":"req-gateway"`)
+		w = post(constant.ClaudeCountTokensPath, requestBody, token.Key+"-99999", nil)
+		require.Equal(t, 400, w.Code)
+		assert.Empty(t, takeCalls())
+	})
+	t.Run("request redact", func(t *testing.T) {
+		oldErrorLogs := constant.ErrorLogEnabled
+		constant.ErrorLogEnabled = true
+		t.Cleanup(func() { constant.ErrorLogEnabled = oldErrorLogs })
+		source, err := plugins.Source("request-redact")
+		require.NoError(t, err)
+		previousRegistry := jsplugin.DefaultRegistry
+		jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+		t.Cleanup(func() { jsplugin.DefaultRegistry = previousRegistry })
+		_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "request-redact"})
+		require.NoError(t, err)
+		saved, err := common.Marshal(request_plugin_setting.GetInstances())
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{request_plugin_setting.InstancesOption: string(saved)}))
+		})
+		configure := func(global bool) {
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{request_plugin_setting.InstancesOption: fmt.Sprintf(`[{"id":"count-redact","name":"Redact","plugin":"request-redact","enabled":true,"global":%t,"config":{"categories":["email"]}}]`, global)}))
+		}
+		configure(true)
+		sensitive := strings.Replace(requestBody, "hello", "customer@example.org", 1)
+		w := post(constant.ClaudeCountTokensPath, sensitive, token.Key, nil)
+		require.Equal(t, 200, w.Code, w.Body.String())
+		got := takeCalls()
+		require.Len(t, got, 1)
+		assert.Contains(t, got[0].body, "[REDACTED]")
+		assert.NotContains(t, got[0].body, "customer@example.org")
+		require.NoError(t, model.DB.Model(&native).Update("param_override", `{"system":"customer@example.org"}`).Error)
+		w = post(constant.ClaudeCountTokensPath, requestBody, token.Key, nil)
+		require.Equal(t, 400, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), "sensitive_content")
+		assert.Contains(t, w.Body.String(), `"type":"new_api_error"`)
+		assert.Empty(t, takeCalls())
+		configure(false)
+		require.NoError(t, model.DB.Model(&native).Update("setting", `{"pass_through_body_enabled":true,"request_plugins":["count-redact"]}`).Error)
+		w = post(constant.ClaudeCountTokensPath, sensitive, token.Key, nil)
+		require.Equal(t, 400, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), "sensitive_content")
+		assert.Contains(t, w.Body.String(), `"type":"new_api_error"`)
+		assert.Empty(t, takeCalls())
+		var policyErrors int64
+		require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("type = ? AND channel_id = ?", model.LogTypeError, native.Id).Count(&policyErrors).Error)
+		assert.EqualValues(t, 2, policyErrors)
+	})
 	require.NoError(t, model.DB.First(&native, native.Id).Error)
 	assert.Equal(t, common.ChannelStatusEnabled, native.Status)
 	assert.Zero(t, native.UsedQuota)
@@ -328,4 +458,59 @@ func TestClaudeCountTokensRelay(t *testing.T) {
 	var charges int64
 	require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("type = ?", model.LogTypeConsume).Count(&charges).Error)
 	assert.Zero(t, charges)
+}
+
+// Exercise the two real distributor routes, observing their selected channels
+// before generation or billing. Priorities make the ordinary selection deterministic.
+func TestClaudeCountTokensLeavesMessageAffinityAlone(t *testing.T) {
+	setupRelayRouterTestDB(t)
+	require.NoError(t, i18n.Init())
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}))
+	cache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() { common.MemoryCacheEnabled = cache })
+	const modelName = "claude-affinity-test"
+	native := model.Channel{Type: constant.ChannelTypeAnthropic, Group: "default", Models: modelName, Status: common.ChannelStatusEnabled, Key: "test", Priority: common.GetPointer(int64(1))}
+	other := model.Channel{Type: constant.ChannelTypeOpenAI, Group: "default", Models: modelName, Status: common.ChannelStatusEnabled, Key: "other", Priority: common.GetPointer(int64(2))}
+	for _, ch := range []*model.Channel{&native, &other} {
+		require.NoError(t, model.DB.Create(ch).Error)
+		require.NoError(t, ch.AddAbilities(nil))
+	}
+	setting := operation_setting.GetChannelAffinitySetting()
+	saved := *setting
+	const rule = "count-affinity-regression"
+	setting.Enabled = true
+	setting.KeepOnChannelDisabled = false
+	setting.Rules = []operation_setting.ChannelAffinityRule{{Name: rule, ModelRegex: []string{"^claude-"}, PathRegex: []string{"/v1/messages"}, SessionMode: "strict", IncludeRuleName: true, KeySources: []operation_setting.ChannelAffinityKeySource{{Type: "gjson", Path: "metadata.user_id"}}}}
+	t.Cleanup(func() {
+		_, err := service.ClearChannelAffinityCacheByRuleName(rule)
+		assert.NoError(t, err)
+		*setting = saved
+	})
+	engine := gin.New()
+	engine.Use(middleware.BodyStorageCleanup(), func(c *gin.Context) { common.SetContextKey(c, constant.ContextKeyUsingGroup, "default"); c.Next() }, middleware.Distribute())
+	for _, route := range []string{constant.ClaudeCountTokensPath, "/v1/messages"} {
+		engine.POST(route, func(c *gin.Context) { c.String(200, "%d", c.GetInt("channel_id")) })
+	}
+	// First count may not establish a binding. The next count may not clear an
+	// OpenAI binding, even when re-selection would now prefer Anthropic.
+	steps := []struct {
+		path string
+		want int
+	}{{constant.ClaudeCountTokensPath, native.Id}, {"/v1/messages", other.Id}, {constant.ClaudeCountTokensPath, native.Id}, {"/v1/messages", other.Id}}
+	for i, step := range steps {
+		if i == 2 {
+			require.NoError(t, model.DB.Model(&native).Update("priority", 10).Error)
+			require.NoError(t, model.DB.Model(&model.Ability{}).Where("channel_id = ?", native.Id).Update("priority", 10).Error)
+		}
+		req := httptest.NewRequest(http.MethodPost, step.path, strings.NewReader(`{"model":"claude-affinity-test","messages":[{"role":"user","content":"hello"}],"metadata":{"user_id":"count-user"}}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		require.Equal(t, 200, w.Code, w.Body.String())
+		require.Equal(t, fmt.Sprint(step.want), w.Body.String())
+		if i == 0 {
+			assert.Zero(t, service.GetChannelAffinityCacheStats().ByRuleName[rule])
+		}
+	}
 }

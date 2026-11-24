@@ -57,8 +57,23 @@ func AbortWithClaudeError(c *gin.Context, status int, message string) {
 	case http.StatusTooManyRequests:
 		errorType = "rate_limit_error"
 	}
-	c.AbortWithStatusJSON(status, gin.H{"type": "error", "error": types.ClaudeError{Type: errorType, Message: common.MessageWithRequestId(message, c.GetString(common.RequestIdKey))}})
-	logger.LogError(c.Request.Context(), common.LogText("user %d | %s", c.GetInt("id"), message))
+	AbortWithClaudeRelayError(c, status, types.ClaudeError{Type: errorType, Message: message})
+}
+
+// AbortWithClaudeRelayError preserves the error classification of the relay.
+func AbortWithClaudeRelayError(c *gin.Context, status int, relayErr types.ClaudeError) {
+	requestID := c.GetString(common.RequestIdKey)
+	logger.LogError(c.Request.Context(), common.LogText("user %d | %s", c.GetInt("id"), relayErr.Message))
+	relayErr.Message = common.MessageWithRequestId(relayErr.Message, requestID)
+	body := gin.H{"type": "error", "error": relayErr}
+	if upstreamID := c.Writer.Header().Get("request-id"); upstreamID != "" {
+		requestID = upstreamID
+	}
+	if requestID != "" {
+		c.Header("request-id", requestID)
+		body["request_id"] = requestID
+	}
+	c.AbortWithStatusJSON(status, body)
 }
 
 // invalidRequestStatus is the status of a request whose body could not be

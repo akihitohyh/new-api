@@ -40,6 +40,7 @@ relay.group_upstream_saturated: "The upstream of the current group is at capacit
 relay.retry_get_channel_failed: "Failed to get available channel for model {{.Model}} under group {{.Group}} (retry): {{.Error}}"
 relay.retry_no_available_channel: "No available channel for model {{.Model}} under group {{.Group}} (retry)"
 relay.access_token_unsupported: "Access tokens are not supported here"
+relay.upstream_token_count_failed: "Upstream token counting request failed"
 relay.request_rejected: "Request rejected by policy"
 relay.request_plugin_failed: "A request plugin failed"
 relay.response_rejected: "Response stopped by policy"

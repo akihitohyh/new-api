@@ -52,6 +52,7 @@ const (
 
 	RelayModeToolsSearch
 	RelayModeToolsFetch
+	RelayModeClaudeCountTokens
 )
 
 func Path2RelayMode(path string) int {

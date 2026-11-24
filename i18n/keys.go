@@ -49,6 +49,7 @@ const (
 	MsgRelayRetryGetChannelFailed        = "relay.retry_get_channel_failed"
 	MsgRelayRetryNoAvailableChannel      = "relay.retry_no_available_channel"
 	MsgRelayAccessTokenUnsupported       = "relay.access_token_unsupported"
+	MsgRelayUpstreamTokenCountFailed     = "relay.upstream_token_count_failed"
 	MsgRelayRequestRejected              = "relay.request_rejected"
 	MsgRelayRequestPluginFailed          = "relay.request_plugin_failed"
 	MsgRelayResponseRejected             = "relay.response_rejected"

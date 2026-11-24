@@ -9,6 +9,7 @@ import (
 )
 
 var filterEvalOrder = []dto.ChannelFilterKind{
+	dto.FilterClaudeCountTokens,
 	dto.FilterRequestPath,
 	dto.FilterTaskPluginEndpoint,
 	dto.FilterTaskPluginIdentity,
@@ -91,10 +92,9 @@ func candidatePassesKindFilters(ch *Channel, exists bool, modelName string, kind
 
 func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilter) bool {
 	switch filter.Kind {
+	case dto.FilterClaudeCountTokens:
+		return ch.Type == constant.ChannelTypeAnthropic
 	case dto.FilterRequestPath:
-		if filter.RequestPath == constant.ClaudeCountTokensPath {
-			return ch.Type == constant.ChannelTypeAnthropic
-		}
 		if filter.RequestPath == "" {
 			return true
 		}

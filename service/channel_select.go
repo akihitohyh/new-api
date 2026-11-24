@@ -47,6 +47,7 @@ func AppendTaskPluginIdentityFilter(c *gin.Context, pluginKey string) {
 }
 
 type RetryParam struct {
+	SkipAffinity bool
 	Ctx          *gin.Context
 	TokenGroup   string
 	ModelName    string
@@ -320,7 +321,7 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 			return nil, "", &ChannelSelectError{
 				StatusCode: http.StatusBadRequest, Code: types.ErrorCode(kind), MessageID: i18n.MsgDistributorNoAvailableChannel,
 				Params:     map[string]any{"Group": common.GetContextKeyString(c, constant.ContextKeyUsingGroup), "Model": modelName},
-				FilterKind: kind, Channel: channel,
+				FilterKind: kind, Channel: channel, NoAvailableChannel: kind == dto.FilterClaudeCountTokens,
 			}
 		}
 		return channel, "", nil
@@ -329,7 +330,7 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 	usingGroup := retry.TokenGroup
 	var channel *model.Channel
 	var selectGroup string
-	if retry.GetRetry() == 0 {
+	if !retry.SkipAffinity && retry.GetRetry() == 0 {
 		if preferredChannelID, found := GetPreferredChannelByAffinity(c, modelName, usingGroup); found {
 			affinityUsable := false
 			preferred, err := model.CacheGetChannel(preferredChannelID)

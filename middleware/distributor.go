@@ -40,6 +40,10 @@ func Distribute() func(c *gin.Context) {
 			}
 		}()
 		constraints := service.GetChannelConstraints(c)
+		countTokens := c.FullPath() == constant.ClaudeCountTokensPath
+		if countTokens {
+			constraints.AddFilter(taskdto.ChannelFilter{Kind: taskdto.FilterClaudeCountTokens})
+		}
 		constraints.AddFilter(taskdto.ChannelFilter{
 			Kind:        taskdto.FilterRequestPath,
 			RequestPath: c.Request.URL.Path,
@@ -109,11 +113,12 @@ func Distribute() func(c *gin.Context) {
 			}
 			if channel == nil {
 				channel, _, selectErr = service.SelectChannelForRequest(c, modelRequest.Model, &service.RetryParam{
-					Ctx:         c,
-					ModelName:   modelRequest.Model,
-					TokenGroup:  usingGroup,
-					RequestPath: c.Request.URL.Path,
-					Retry:       common.GetPointer(0),
+					Ctx:          c,
+					ModelName:    modelRequest.Model,
+					TokenGroup:   usingGroup,
+					SkipAffinity: countTokens,
+					RequestPath:  c.Request.URL.Path,
+					Retry:        common.GetPointer(0),
 				})
 			}
 			if selectErr != nil {
@@ -124,7 +129,7 @@ func Distribute() func(c *gin.Context) {
 				status := selectErr.StatusCode
 				if selectErr.NoAvailableChannel {
 					message = noAvailableChannelMessage(c, usingGroup, modelRequest.Model)
-					if c.Request.URL.Path == constant.ClaudeCountTokensPath {
+					if countTokens {
 						status = http.StatusNotFound
 					}
 				} else if selectErr.MessageID != "" {
@@ -135,12 +140,12 @@ func Distribute() func(c *gin.Context) {
 			}
 		}
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
-		if err := SetupContextForSelectedChannel(c, channel, modelRequest.Model); err != nil && c.Request.URL.Path == constant.ClaudeCountTokensPath {
+		if err := SetupContextForSelectedChannel(c, channel, modelRequest.Model); err != nil && countTokens {
 			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, noAvailableChannelMessage(c, common.GetContextKeyString(c, constant.ContextKeyUsingGroup), modelRequest.Model))
 			return
 		}
 		c.Next()
-		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
+		if !countTokens && channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
 	}
@@ -708,8 +713,10 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	logTaskPluginChannelDecision(c, channel, modelName, "channel_selected", "")
 	paramOverride := channel.GetParamOverride()
 	headerOverride := channel.GetHeaderOverride()
-	if mergedParam, applied := service.ApplyChannelAffinityOverrideTemplate(c, paramOverride); applied {
-		paramOverride = mergedParam
+	if c.FullPath() != constant.ClaudeCountTokensPath {
+		if mergedParam, applied := service.ApplyChannelAffinityOverrideTemplate(c, paramOverride); applied {
+			paramOverride = mergedParam
+		}
 	}
 	common.SetContextKey(c, constant.ContextKeyChannelParamOverride, paramOverride)
 	common.SetContextKey(c, constant.ContextKeyChannelHeaderOverride, headerOverride)

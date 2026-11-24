@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,11 +10,13 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relay/requestplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -28,64 +31,136 @@ import (
 // CountClaudeTokens sends one native counting request outside the generation,
 // billing and channel-health pipelines. New count-only JSON fields pass through.
 func CountClaudeTokens(c *gin.Context) {
-	info := relaycommon.GenRelayInfoClaude(c, nil)
+	steps, record, apiErr := requestplugin.Ingress(c, types.RelayFormatClaude)
+	var info *relaycommon.RelayInfo
+	defer func() {
+		if apiErr != nil && !c.Writer.Written() {
+			service.RecordRequestPolicyTermination(c, apiErr)
+			switch apiErr.GetErrorCode() {
+			case types.ErrorCodeRequestRejected, types.ErrorCodeRequestPluginFailed:
+				audit := info
+				channelID := 0
+				if audit == nil {
+					audit = &relaycommon.RelayInfo{}
+					audit.SetRequestPluginIngress(steps, record)
+				} else {
+					channelID = audit.ChannelId
+				}
+				service.RecordRelayErrorLog(c, channelID, apiErr, audit)
+				middleware.AbortWithClaudeRelayError(c, apiErr.StatusCode, apiErr.ToClaudeError(common.UpstreamAddresses(c)...))
+			default:
+				middleware.AbortWithClaudeError(c, apiErr.StatusCode, apiErr.MaskSensitiveError(common.UpstreamAddresses(c)...))
+			}
+		}
+		requestplugin.Report(c, types.RelayFormatClaude, info, record, apiErr)
+	}()
+	if apiErr != nil {
+		return
+	}
+	info = relaycommon.GenRelayInfoClaude(c, nil)
+	info.RelayMode = relayconstant.RelayModeClaudeCountTokens
+	info.SetRequestPluginIngress(steps, record)
 	info.InitChannelMeta(c)
 	storage, err := common.GetBodyStorage(c)
 	if err != nil {
-		middleware.AbortWithClaudeError(c, http.StatusBadRequest, err.Error())
+		apiErr = types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest)
 		return
 	}
 	var body io.Reader = common.NewReplayableBodyReader(storage)
-	if !model_setting.GetGlobalSettings().PassThroughRequestEnabled && !info.ChannelSetting.PassThroughBodyEnabled {
-		if err := helper.ModelMappedHelper(c, info, nil); err != nil {
-			middleware.AbortWithClaudeError(c, http.StatusInternalServerError, err.Error())
+	if model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled {
+		if apiErr = requestplugin.PassThrough(c, info, storage); apiErr != nil {
 			return
 		}
-		if info.IsModelMapped || len(info.ParamOverride) > 0 {
-			data, err := storage.Bytes()
-			if err != nil {
-				middleware.AbortWithClaudeError(c, http.StatusBadRequest, err.Error())
+	} else {
+		data, err := storage.Bytes()
+		if err != nil {
+			apiErr = types.NewError(err, types.ErrorCodeReadRequestBodyFailed)
+			return
+		}
+		// Request-stage policy reads the Claude message. Keep the original JSON for
+		// forwarding so fields specific to counting survive model normalization.
+		var request dto.ClaudeRequest
+		if err = common.Unmarshal(data, &request); err != nil {
+			apiErr = types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest)
+			return
+		}
+		info.Request = &request
+		if err = helper.ModelMappedHelper(c, info, nil); err != nil {
+			apiErr = types.NewError(err, types.ErrorCodeChannelModelMappedError)
+			return
+		}
+		if err = helper.ApplyReasoningModelSuffix(c, info); err != nil {
+			apiErr = newConvertRequestFailedError(c, info, err)
+			return
+		}
+		if info.UpstreamModelName != info.OriginModelName {
+			doc := ojson.NewDoc(data)
+			if err = relaycommon.SetJSONMember(doc, "", "model", info.UpstreamModelName); err != nil {
+				apiErr = types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest)
 				return
 			}
-			if info.IsModelMapped {
-				doc := ojson.NewDoc(data)
-				if err := relaycommon.SetJSONMember(doc, "", "model", info.UpstreamModelName); err != nil {
-					middleware.AbortWithClaudeError(c, http.StatusBadRequest, err.Error())
-					return
-				}
-				data = doc.Bytes()
-			}
-			if len(info.ParamOverride) > 0 {
-				data, err = relaycommon.ApplyParamOverrideWithRelayInfo(data, info)
-				if err != nil {
-					apiErr := newAPIErrorFromParamOverride(err)
-					middleware.AbortWithClaudeError(c, apiErr.StatusCode, apiErr.MaskSensitiveError())
-					return
-				}
-			}
-			body = bytes.NewReader(data)
+			data = doc.Bytes()
 		}
+		if data, apiErr = requestplugin.Outbound(c, info, data); apiErr != nil {
+			return
+		}
+		if len(info.ParamOverride) > 0 {
+			if data, err = relaycommon.ApplyParamOverrideWithRelayInfo(data, info); err != nil {
+				apiErr = newAPIErrorFromParamOverride(err)
+				return
+			}
+		}
+		if apiErr = requestplugin.Egress(c, info, data); apiErr != nil {
+			return
+		}
+		body = bytes.NewReader(data)
 	}
 	resp, err := channel.DoApiRequest(&claude.Adaptor{}, c, info, body)
 	if err != nil {
-		middleware.AbortWithClaudeError(c, http.StatusBadGateway, "Upstream token counting request failed")
+		apiErr = types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgRelayUpstreamTokenCountFailed)), types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
 		return
 	}
 	defer service.CloseResponseBodyGracefully(resp)
+	addresses := common.UpstreamAddresses(c)
+	// A compatible upstream may echo credentials outside the message, including
+	// its request ID or error type. Sanitize every string returned from errors.
+	redact := func(value string) string {
+		if value == "" {
+			return ""
+		}
+		if info.ApiKey != "" {
+			value = strings.ReplaceAll(value, info.ApiKey, "***")
+		}
+		return common.MaskSensitiveInfo(value, addresses...)
+	}
+	requestID := redact(resp.Header.Get("request-id"))
+	if requestID != "" {
+		c.Header("request-id", requestID)
+	}
 	if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
-		c.Header("Retry-After", retryAfter)
+		c.Header("Retry-After", redact(retryAfter))
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
-		data, err := io.ReadAll(resp.Body)
+		const maxErrorBytes = 64 << 10
+		data, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBytes+1))
 		var envelope struct {
-			Type  string
-			Error types.ClaudeError
+			Type      string            `json:"type"`
+			Error     types.ClaudeError `json:"error"`
+			RequestID string            `json:"request_id,omitempty"`
 		}
-		if err != nil || common.Unmarshal(data, &envelope) != nil || envelope.Type != "error" || envelope.Error.Type == "" {
-			middleware.AbortWithClaudeError(c, resp.StatusCode, "Upstream token counting request failed")
+		if err != nil || len(data) > maxErrorBytes || common.Unmarshal(data, &envelope) != nil || envelope.Type != "error" || envelope.Error.Type == "" {
+			apiErr = types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgRelayUpstreamTokenCountFailed)), types.ErrorCodeBadResponseBody, resp.StatusCode)
 			return
 		}
-		c.Data(resp.StatusCode, gin.MIMEJSON, data)
+		envelope.Error.Type = redact(envelope.Error.Type)
+		envelope.Error.Message = redact(envelope.Error.Message)
+		if envelope.RequestID != "" {
+			envelope.RequestID = redact(envelope.RequestID)
+		} else {
+			envelope.RequestID = requestID
+		}
+		apiErr = types.WithClaudeError(envelope.Error, resp.StatusCode)
+		c.JSON(resp.StatusCode, envelope)
 		return
 	}
 	c.DataFromReader(resp.StatusCode, resp.ContentLength, gin.MIMEJSON, resp.Body, nil)

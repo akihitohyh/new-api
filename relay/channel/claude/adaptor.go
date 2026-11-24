@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -76,7 +77,7 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 
 func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 	path := "/v1/messages"
-	if requestPath, _, _ := strings.Cut(info.RequestURLPath, "?"); requestPath == constant.ClaudeCountTokensPath {
+	if info.RelayMode == relayconstant.RelayModeClaudeCountTokens {
 		path = constant.ClaudeCountTokensPath
 	}
 	requestURL := strings.TrimRight(info.ChannelBaseUrl, "/") + path

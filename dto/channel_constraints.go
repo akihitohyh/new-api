@@ -37,6 +37,7 @@ type ChannelFilterKind string
 
 const (
 	FilterRequestPath        ChannelFilterKind = "request_path"
+	FilterClaudeCountTokens  ChannelFilterKind = "claude_count_tokens"
 	FilterTaskPluginEndpoint ChannelFilterKind = "task_plugin_endpoint"
 	FilterTaskPluginIdentity ChannelFilterKind = "task_plugin_identity"
 	FilterResponsesWebSocket ChannelFilterKind = "responses_websocket"
