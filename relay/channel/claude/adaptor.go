@@ -76,11 +76,10 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 }
 
 func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
-	path := "/v1/messages"
+	requestURL := info.ChannelBaseUrl + "/v1/messages"
 	if info.RelayMode == relayconstant.RelayModeClaudeCountTokens {
-		path = constant.ClaudeCountTokensPath
+		requestURL = strings.TrimRight(info.ChannelBaseUrl, "/") + constant.ClaudeCountTokensPath
 	}
-	requestURL := strings.TrimRight(info.ChannelBaseUrl, "/") + path
 	if !shouldAppendClaudeBetaQuery(info) {
 		return requestURL, nil
 	}

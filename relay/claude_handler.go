@@ -2,10 +2,12 @@ package relay
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -122,14 +124,28 @@ func CountClaudeTokens(c *gin.Context) {
 	}
 	defer service.CloseResponseBodyGracefully(resp)
 	addresses := common.UpstreamAddresses(c)
+	credentials := []string{info.ApiKey}
+	if req := resp.Request; req != nil {
+		credentials = append(credentials, req.Header.Values("X-Api-Key")...)
+		for _, auth := range req.Header.Values("Authorization") {
+			credentials = append(credentials, auth)
+			if fields := strings.Fields(auth); len(fields) == 2 && strings.EqualFold(fields[0], "Bearer") {
+				credentials = append(credentials, fields[1])
+			}
+		}
+	}
+	// Mask longer credentials first when an override extends the channel key.
+	slices.SortFunc(credentials, func(a, b string) int { return cmp.Compare(len(b), len(a)) })
 	// A compatible upstream may echo credentials outside the message, including
 	// its request ID or error type. Sanitize every string returned from errors.
 	redact := func(value string) string {
 		if value == "" {
 			return ""
 		}
-		if info.ApiKey != "" {
-			value = strings.ReplaceAll(value, info.ApiKey, "***")
+		for _, credential := range credentials {
+			if credential != "" {
+				value = strings.ReplaceAll(value, credential, "***")
+			}
 		}
 		return common.MaskSensitiveInfo(value, addresses...)
 	}
@@ -140,30 +156,34 @@ func CountClaudeTokens(c *gin.Context) {
 	if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
 		c.Header("Retry-After", redact(retryAfter))
 	}
-	if resp.StatusCode >= http.StatusBadRequest {
-		const maxErrorBytes = 64 << 10
-		data, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBytes+1))
-		var envelope struct {
-			Type      string            `json:"type"`
-			Error     types.ClaudeError `json:"error"`
-			RequestID string            `json:"request_id,omitempty"`
-		}
-		if err != nil || len(data) > maxErrorBytes || common.Unmarshal(data, &envelope) != nil || envelope.Type != "error" || envelope.Error.Type == "" {
-			apiErr = types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgRelayUpstreamTokenCountFailed)), types.ErrorCodeBadResponseBody, resp.StatusCode)
-			return
-		}
-		envelope.Error.Type = redact(envelope.Error.Type)
-		envelope.Error.Message = redact(envelope.Error.Message)
-		if envelope.RequestID != "" {
-			envelope.RequestID = redact(envelope.RequestID)
-		} else {
-			envelope.RequestID = requestID
-		}
-		apiErr = types.WithClaudeError(envelope.Error, resp.StatusCode)
-		c.JSON(resp.StatusCode, envelope)
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		c.DataFromReader(resp.StatusCode, resp.ContentLength, gin.MIMEJSON, resp.Body, nil)
 		return
 	}
-	c.DataFromReader(resp.StatusCode, resp.ContentLength, gin.MIMEJSON, resp.Body, nil)
+	if resp.StatusCode < http.StatusBadRequest {
+		apiErr = types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgRelayUpstreamTokenCountFailed)), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway)
+		return
+	}
+	const maxErrorBytes = 64 << 10
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBytes+1))
+	var envelope struct {
+		Type      string            `json:"type"`
+		Error     types.ClaudeError `json:"error"`
+		RequestID string            `json:"request_id,omitempty"`
+	}
+	if err != nil || len(data) > maxErrorBytes || common.Unmarshal(data, &envelope) != nil || envelope.Type != "error" || envelope.Error.Type == "" {
+		apiErr = types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgRelayUpstreamTokenCountFailed)), types.ErrorCodeBadResponseBody, resp.StatusCode)
+		return
+	}
+	envelope.Error.Type = redact(envelope.Error.Type)
+	envelope.Error.Message = redact(envelope.Error.Message)
+	if envelope.RequestID != "" {
+		envelope.RequestID = redact(envelope.RequestID)
+	} else {
+		envelope.RequestID = requestID
+	}
+	apiErr = types.WithClaudeError(envelope.Error, resp.StatusCode)
+	c.JSON(resp.StatusCode, envelope)
 }
 
 func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {

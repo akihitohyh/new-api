@@ -8,6 +8,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/model_setting"
@@ -15,6 +16,18 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestGetRequestURLWithTrailingSlash(t *testing.T) {
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://upstream.test/"}, IsClaudeBetaQuery: true}
+	adaptor := &Adaptor{}
+	u, err := adaptor.GetRequestURL(info)
+	require.NoError(t, err)
+	assert.Equal(t, "https://upstream.test//v1/messages?beta=true", u)
+	info.RelayMode = relayconstant.RelayModeClaudeCountTokens
+	u, err = adaptor.GetRequestURL(info)
+	require.NoError(t, err)
+	assert.Equal(t, "https://upstream.test/v1/messages/count_tokens?beta=true", u)
+}
 
 func TestConvertClaudeRequestTreatsZeroMaxTokensAsUnset(t *testing.T) {
 	zero := uint(0)

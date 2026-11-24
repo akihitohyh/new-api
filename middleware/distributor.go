@@ -713,10 +713,8 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	logTaskPluginChannelDecision(c, channel, modelName, "channel_selected", "")
 	paramOverride := channel.GetParamOverride()
 	headerOverride := channel.GetHeaderOverride()
-	if c.FullPath() != constant.ClaudeCountTokensPath {
-		if mergedParam, applied := service.ApplyChannelAffinityOverrideTemplate(c, paramOverride); applied {
-			paramOverride = mergedParam
-		}
+	if mergedParam, applied := service.ApplyChannelAffinityOverrideTemplate(c, paramOverride); applied {
+		paramOverride = mergedParam
 	}
 	common.SetContextKey(c, constant.ContextKeyChannelParamOverride, paramOverride)
 	common.SetContextKey(c, constant.ContextKeyChannelHeaderOverride, headerOverride)

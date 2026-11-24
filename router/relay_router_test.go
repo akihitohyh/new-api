@@ -223,14 +223,13 @@ func TestClaudeCountTokensRelay(t *testing.T) {
 	var mu sync.Mutex
 	var calls []observed
 	wrong := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("count_tokens reached OpenAI: %s", r.URL)
+		assert.Failf(t, "count_tokens reached OpenAI", "upstream URL: %s", r.URL)
 		w.WriteHeader(http.StatusTeapot)
 	}))
 	defer wrong.Close()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		data, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Error(err)
+		if !assert.NoError(t, err) {
 			return
 		}
 		mu.Lock()
@@ -238,6 +237,19 @@ func TestClaudeCountTokensRelay(t *testing.T) {
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Header.Get("X-Fixture-Status") {
+		case "401":
+			key := r.Header.Get("x-api-key")
+			auth := r.Header.Get("Authorization")
+			_, token, _ := strings.Cut(auth, " ")
+			echo := strings.Join([]string{key, auth, token, "native-key"}, " | ")
+			w.Header().Set("Request-Id", "req-"+key)
+			w.Header().Set("Retry-After", token)
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = fmt.Fprintf(w, `{"type":"error","error":{"type":"authentication_error","message":%q},"request_id":%q}`, echo, "req-"+token)
+		case "307":
+			w.Header().Set("Location", "/private-redirect")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			_, _ = io.WriteString(w, "private redirect page")
 		case "429":
 			w.Header().Set("Retry-After", "4")
 			w.WriteHeader(429)
@@ -368,6 +380,36 @@ func TestClaudeCountTokensRelay(t *testing.T) {
 		return w
 	}
 	takeCalls := func() []observed { mu.Lock(); defer mu.Unlock(); got := calls; calls = nil; return got }
+	t.Run("mask outbound credentials", func(t *testing.T) {
+		const key = "native-key-override"
+		const bearer = "fixture-access-token"
+		previous := *native.HeaderOverride
+		override, err := common.Marshal(map[string]string{"x-api-key": key, "Authorization": "bEaReR " + bearer, "x-fixture-status": "401"})
+		require.NoError(t, err)
+		require.NoError(t, model.DB.Model(&native).Update("header_override", string(override)).Error)
+		t.Cleanup(func() { require.NoError(t, model.DB.Model(&native).Update("header_override", previous).Error) })
+		w := post(constant.ClaudeCountTokensPath, requestBody, token.Key, nil)
+		require.Equal(t, http.StatusUnauthorized, w.Code)
+		got := takeCalls()
+		require.Len(t, got, 1)
+		assert.Equal(t, key, got[0].header.Get("x-api-key"))
+		assert.Equal(t, "bEaReR "+bearer, got[0].header.Get("Authorization"))
+		assert.JSONEq(t, `{"type":"error","error":{"type":"authentication_error","message":"*** | *** | *** | ***"},"request_id":"req-***"}`, w.Body.String())
+		assert.Equal(t, "req-***", w.Header().Get("Request-Id"))
+		assert.Equal(t, "***", w.Header().Get("Retry-After"))
+		for _, secret := range []string{key, bearer, native.Key} {
+			assert.NotContains(t, w.Body.String(), secret)
+			assert.NotContains(t, fmt.Sprint(w.Header()), secret)
+		}
+	})
+	t.Run("redirect is a localized gateway error", func(t *testing.T) {
+		w := post(constant.ClaudeCountTokensPath, requestBody, token.Key, map[string]string{"x-fixture-status": "307", "Accept-Language": "zh-CN"})
+		require.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), "上游令牌计数请求失败")
+		assert.NotContains(t, w.Body.String(), "private")
+		assert.Empty(t, w.Header().Get("Location"))
+		assert.Len(t, takeCalls(), 1)
+	})
 	t.Run("equivalent route", func(t *testing.T) {
 		for _, path := range []string{"/v1/messages/%63ount_tokens", "http://gateway.test/v1/messages/count_tokens?beta=true"} {
 			w := post(path, requestBody, token.Key, nil)
