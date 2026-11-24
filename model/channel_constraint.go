@@ -92,6 +92,9 @@ func candidatePassesKindFilters(ch *Channel, exists bool, modelName string, kind
 func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilter) bool {
 	switch filter.Kind {
 	case dto.FilterRequestPath:
+		if filter.RequestPath == constant.ClaudeCountTokensPath {
+			return ch.Type == constant.ChannelTypeAnthropic
+		}
 		if filter.RequestPath == "" {
 			return true
 		}

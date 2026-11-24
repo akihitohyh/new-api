@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +10,9 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/claude"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relay/requestplugin"
@@ -17,8 +21,75 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 )
+
+// CountClaudeTokens sends one native counting request outside the generation,
+// billing and channel-health pipelines. New count-only JSON fields pass through.
+func CountClaudeTokens(c *gin.Context) {
+	info := relaycommon.GenRelayInfoClaude(c, nil)
+	info.InitChannelMeta(c)
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		middleware.AbortWithClaudeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	var body io.Reader = common.NewReplayableBodyReader(storage)
+	if !model_setting.GetGlobalSettings().PassThroughRequestEnabled && !info.ChannelSetting.PassThroughBodyEnabled {
+		if err := helper.ModelMappedHelper(c, info, nil); err != nil {
+			middleware.AbortWithClaudeError(c, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if info.IsModelMapped || len(info.ParamOverride) > 0 {
+			data, err := storage.Bytes()
+			if err != nil {
+				middleware.AbortWithClaudeError(c, http.StatusBadRequest, err.Error())
+				return
+			}
+			if info.IsModelMapped {
+				doc := ojson.NewDoc(data)
+				if err := relaycommon.SetJSONMember(doc, "", "model", info.UpstreamModelName); err != nil {
+					middleware.AbortWithClaudeError(c, http.StatusBadRequest, err.Error())
+					return
+				}
+				data = doc.Bytes()
+			}
+			if len(info.ParamOverride) > 0 {
+				data, err = relaycommon.ApplyParamOverrideWithRelayInfo(data, info)
+				if err != nil {
+					apiErr := newAPIErrorFromParamOverride(err)
+					middleware.AbortWithClaudeError(c, apiErr.StatusCode, apiErr.MaskSensitiveError())
+					return
+				}
+			}
+			body = bytes.NewReader(data)
+		}
+	}
+	resp, err := channel.DoApiRequest(&claude.Adaptor{}, c, info, body)
+	if err != nil {
+		middleware.AbortWithClaudeError(c, http.StatusBadGateway, "Upstream token counting request failed")
+		return
+	}
+	defer service.CloseResponseBodyGracefully(resp)
+	if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+		c.Header("Retry-After", retryAfter)
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		data, err := io.ReadAll(resp.Body)
+		var envelope struct {
+			Type  string
+			Error types.ClaudeError
+		}
+		if err != nil || common.Unmarshal(data, &envelope) != nil || envelope.Type != "error" || envelope.Error.Type == "" {
+			middleware.AbortWithClaudeError(c, resp.StatusCode, "Upstream token counting request failed")
+			return
+		}
+		c.Data(resp.StatusCode, gin.MIMEJSON, data)
+		return
+	}
+	c.DataFromReader(resp.StatusCode, resp.ContentLength, gin.MIMEJSON, resp.Body, nil)
+}
 
 func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
 

@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
@@ -12,6 +13,10 @@ import (
 )
 
 func abortWithOpenAiMessage(c *gin.Context, statusCode int, message string, code ...types.ErrorCode) {
+	if c.FullPath() == constant.ClaudeCountTokensPath {
+		AbortWithClaudeError(c, statusCode, message)
+		return
+	}
 	codeStr := ""
 	if len(code) > 0 {
 		codeStr = string(code[0])
@@ -33,6 +38,27 @@ func abortWithOpenAiMessage(c *gin.Context, statusCode int, message string, code
 	}
 	c.Abort()
 	logger.LogError(c.Request.Context(), common.LogText("user %d | %s", userId, message))
+}
+
+// AbortWithClaudeError writes a gateway-generated error for an Anthropic client.
+func AbortWithClaudeError(c *gin.Context, status int, message string) {
+	errorType := "api_error"
+	switch status {
+	case http.StatusBadRequest:
+		errorType = "invalid_request_error"
+	case http.StatusUnauthorized:
+		errorType = "authentication_error"
+	case http.StatusForbidden:
+		errorType = "permission_error"
+	case http.StatusNotFound:
+		errorType = "not_found_error"
+	case http.StatusRequestEntityTooLarge:
+		errorType = "request_too_large"
+	case http.StatusTooManyRequests:
+		errorType = "rate_limit_error"
+	}
+	c.AbortWithStatusJSON(status, gin.H{"type": "error", "error": types.ClaudeError{Type: errorType, Message: common.MessageWithRequestId(message, c.GetString(common.RequestIdKey))}})
+	logger.LogError(c.Request.Context(), common.LogText("user %d | %s", c.GetInt("id"), message))
 }
 
 // invalidRequestStatus is the status of a request whose body could not be

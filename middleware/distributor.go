@@ -121,17 +121,24 @@ func Distribute() func(c *gin.Context) {
 					logTaskPluginChannelDecision(c, selectErr.Channel, modelRequest.Model, "channel_rejected", "identity_mismatch")
 				}
 				message := selectErr.Message
+				status := selectErr.StatusCode
 				if selectErr.NoAvailableChannel {
 					message = noAvailableChannelMessage(c, usingGroup, modelRequest.Model)
+					if c.Request.URL.Path == constant.ClaudeCountTokensPath {
+						status = http.StatusNotFound
+					}
 				} else if selectErr.MessageID != "" {
 					message = i18n.T(c, selectErr.MessageID, selectErr.Params)
 				}
-				abortWithOpenAiMessage(c, selectErr.StatusCode, message, selectErr.Code)
+				abortWithOpenAiMessage(c, status, message, selectErr.Code)
 				return
 			}
 		}
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
-		SetupContextForSelectedChannel(c, channel, modelRequest.Model)
+		if err := SetupContextForSelectedChannel(c, channel, modelRequest.Model); err != nil && c.Request.URL.Path == constant.ClaudeCountTokensPath {
+			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, noAvailableChannelMessage(c, common.GetContextKeyString(c, constant.ContextKeyUsingGroup), modelRequest.Model))
+			return
+		}
 		c.Next()
 		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
 			service.RecordChannelAffinity(c, channel.Id)

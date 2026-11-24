@@ -2,6 +2,7 @@ package router
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,10 +10,13 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/plugins"
+	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -180,4 +184,148 @@ func setupRelayRouterTestDB(t *testing.T) {
 			require.NoError(t, os.Unsetenv("SQL_DSN"))
 		}
 	})
+}
+
+func TestClaudeCountTokensRelay(t *testing.T) {
+	setupRelayRouterTestDB(t)
+	require.NoError(t, i18n.Init())
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Log{}))
+	cacheEnabled, autoDisable, logConsume := common.MemoryCacheEnabled, common.AutomaticDisableChannelEnabled, common.LogConsumeEnabled
+	disableCodes := operation_setting.AutomaticDisableStatusCodeRanges
+	global := model_setting.GetGlobalSettings()
+	globalPassThrough := global.PassThroughRequestEnabled
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled, common.AutomaticDisableChannelEnabled, common.LogConsumeEnabled = cacheEnabled, autoDisable, logConsume
+		operation_setting.AutomaticDisableStatusCodeRanges = disableCodes
+		global.PassThroughRequestEnabled = globalPassThrough
+	})
+	common.MemoryCacheEnabled, common.AutomaticDisableChannelEnabled, common.LogConsumeEnabled = false, true, true
+	require.NoError(t, operation_setting.AutomaticDisableStatusCodesFromString("429,500"))
+	user := model.User{Username: "count-user", Status: common.UserStatusEnabled, Group: "default", Quota: 100}
+	require.NoError(t, model.DB.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "counttestkey", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 75}
+	require.NoError(t, model.DB.Create(&token).Error)
+	const requestBody = `{ "model":"alias", "messages":[{"role":"user","content":"hello"}], "future_field":{"n":9007199254740993} }`
+	const success = `{ "input_tokens":123, "future_field":true }`
+	type observed struct {
+		path   string
+		header http.Header
+		body   string
+	}
+	calls := make(chan observed, 2)
+	wrong := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("count_tokens reached OpenAI: %s", r.URL)
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer wrong.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		calls <- observed{r.URL.RequestURI(), r.Header.Clone(), string(data)}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Header.Get("X-Fixture-Status") {
+		case "429":
+			w.Header().Set("Retry-After", "4")
+			w.WriteHeader(429)
+			_, _ = io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"},"request_id":"req1"}`)
+		case "500":
+			w.WriteHeader(500)
+			_, _ = io.WriteString(w, `{"type":"error","error":{"type":"api_error","message":"try later"}}`)
+		default:
+			_, _ = io.WriteString(w, success)
+		}
+	}))
+	defer upstream.Close()
+	native := model.Channel{
+		Type: constant.ChannelTypeAnthropic, Name: "native", Key: "native-key", BaseURL: &upstream.URL,
+		Group: "default", Models: "alias", Status: common.ChannelStatusEnabled, AutoBan: common.GetPointer(1),
+		ModelMapping:   common.GetPointer(`{"alias":"native-model"}`),
+		HeaderOverride: common.GetPointer(`{"x-check":"override","x-fixture-status":"{client_header:x-fixture-status}"}`),
+		ParamOverride:  common.GetPointer(`{"system":"count system"}`),
+	}
+	other := model.Channel{
+		Type: constant.ChannelTypeOpenAI, Name: "other", Key: "other-key", BaseURL: &wrong.URL,
+		Group: "default", Models: "alias,other-only", Status: common.ChannelStatusEnabled, Priority: common.GetPointer(int64(100)),
+	}
+	for _, ch := range []*model.Channel{&native, &other} {
+		require.NoError(t, model.DB.Create(ch).Error)
+		require.NoError(t, ch.AddAbilities(nil))
+	}
+	engine := gin.New()
+	SetRelayRouter(engine)
+	for _, tc := range []struct {
+		name                    string
+		status                  int
+		response                string
+		channelPass, globalPass bool
+	}{
+		{"mapped request", 200, success, false, false},
+		{"rate limited", 429, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"},"request_id":"req1"}`, false, false},
+		{"server error", 500, `{"type":"error","error":{"type":"api_error","message":"try later"}}`, false, false},
+		{"channel passthrough", 200, success, true, false},
+		{"global passthrough", 200, success, false, true},
+		{"only OpenAI serves model", 404, "", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			global.PassThroughRequestEnabled = tc.globalPass
+			require.NoError(t, model.DB.Model(&native).Update("setting", fmt.Sprintf(`{"pass_through_body_enabled":%t}`, tc.channelPass)).Error)
+			payload := requestBody
+			if tc.status == 404 {
+				payload = strings.Replace(payload, "alias", "other-only", 1)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens?beta=true", strings.NewReader(payload))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("x-api-key", token.Key)
+			req.Header.Set("anthropic-version", "fixture-version")
+			req.Header.Add("anthropic-beta", "first")
+			req.Header.Add("anthropic-beta", "second")
+			req.Header.Set("x-fixture-status", fmt.Sprint(tc.status))
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			require.Equal(t, tc.status, w.Code, w.Body.String())
+			if tc.status == 404 {
+				assert.Empty(t, calls)
+				var envelope struct {
+					Type  string
+					Error struct{ Type string }
+				}
+				require.NoError(t, common.Unmarshal(w.Body.Bytes(), &envelope))
+				assert.Equal(t, "error", envelope.Type)
+				assert.Equal(t, "not_found_error", envelope.Error.Type)
+				return
+			}
+			require.Len(t, calls, 1)
+			call := <-calls
+			assert.Equal(t, "/v1/messages/count_tokens?beta=true", call.path)
+			assert.Equal(t, "native-key", call.header.Get("x-api-key"))
+			assert.Equal(t, "fixture-version", call.header.Get("anthropic-version"))
+			assert.Equal(t, "first,second", call.header.Get("anthropic-beta"))
+			assert.Equal(t, "override", call.header.Get("x-check"))
+			if tc.channelPass || tc.globalPass {
+				assert.Equal(t, requestBody, call.body)
+			} else {
+				assert.JSONEq(t, `{"model":"native-model","messages":[{"role":"user","content":"hello"}],"future_field":{"n":9007199254740993},"system":"count system"}`, call.body)
+				assert.Contains(t, call.body, "9007199254740993")
+			}
+			assert.Equal(t, tc.response, w.Body.String())
+			if tc.status == 429 {
+				assert.Equal(t, "4", w.Header().Get("Retry-After"))
+			}
+		})
+	}
+	require.NoError(t, model.DB.First(&native, native.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, native.Status)
+	assert.Zero(t, native.UsedQuota)
+	require.NoError(t, model.DB.First(&user, user.Id).Error)
+	assert.Equal(t, 100, user.Quota)
+	assert.Zero(t, user.UsedQuota)
+	require.NoError(t, model.DB.First(&token, token.Id).Error)
+	assert.Equal(t, 75, token.RemainQuota)
+	assert.Zero(t, token.UsedQuota)
+	var charges int64
+	require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("type = ?", model.LogTypeConsume).Count(&charges).Error)
+	assert.Zero(t, charges)
 }

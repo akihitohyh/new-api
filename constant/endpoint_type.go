@@ -6,6 +6,8 @@ import "github.com/QuantumNous/new-api/relaykit/types"
 // code compiling unchanged.
 type EndpointType = types.EndpointType
 
+const ClaudeCountTokensPath = "/v1/messages/count_tokens"
+
 const (
 	EndpointTypeOpenAI                = types.EndpointTypeOpenAI
 	EndpointTypeOpenAIResponse        = types.EndpointTypeOpenAIResponse
